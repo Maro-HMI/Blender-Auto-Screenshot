@@ -1,40 +1,43 @@
 bl_info = {
     "name": "Auto Screenshots (Timelapse + Fast OpenGL)",
-    "author": "Maro and ChatGPT",
-    "version": (1, 0, 0),
+    "author": "Maro, Matt and ChatGPT",
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "location": "3D View > Sidebar (N) > Auto Screenshots",
-    "description": "Fast, non-blocking timelapse screenshots via OpenGL, with skip-unchanged and MP4 assembly.",
+    "description": "Fast, non-blocking OpenGL timelapse screenshots with smart idle detection and MP4 assembly.",
     "category": "3D View",
 }
 
 import bpy
 import os
+import time
 import shutil
-import hashlib
-import subprocess
 import platform
+import subprocess
 from datetime import datetime
-from bpy.props import (
-    StringProperty,
-    IntProperty,
-    EnumProperty,
-    BoolProperty,
-)
 from bpy.types import Operator, Panel, PropertyGroup
+from bpy.props import (
+    StringProperty, IntProperty,
+    EnumProperty
+)
 
+# =========================================================
+# Global Runtime State
+# =========================================================
 
 _RUNNING = False
 _TIMER = None
-_LAST_FP = None
+_NEXT_CAPTURE_TIME = 0.0
+_LAST_INTERACTION_TIME = 0.0
 
 
-# ---------------------------------------------------------
-# Utility
-# ---------------------------------------------------------
+# =========================================================
+# Utilities
+# =========================================================
 
 def _timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 
 def _resolve_dir(user_dir: str):
     d = user_dir.strip()
@@ -42,15 +45,14 @@ def _resolve_dir(user_dir: str):
         d = "//timelapse"
     return bpy.path.abspath(d)
 
-def _ensure_exists_after_success(path):
+
+def _ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+
 
 def _open_folder(path):
-    """Cross-platform folder opener."""
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
+    _ensure_dir(path)
     system = platform.system()
     if system == "Windows":
         os.startfile(path)
@@ -73,13 +75,14 @@ def _find_viewport_region():
                         return win, area, region
     return None, None, None
 
+
 def _dims(key):
     return (1920, 1080) if key == "1080p" else (1280, 720)
 
 
-# ---------------------------------------------------------
-# Fast OpenGL JPEG Capture
-# ---------------------------------------------------------
+# =========================================================
+# JPEG Capture
+# =========================================================
 
 def _capture_jpeg(path, width, height, quality):
     win, area, region = _find_viewport_region()
@@ -89,13 +92,13 @@ def _capture_jpeg(path, width, height, quality):
     ctx = bpy.context
     scene = ctx.scene
     r = scene.render
-    imgset = r.image_settings
+    img = r.image_settings
 
     old = {
         "filepath": r.filepath,
-        "file_format": imgset.file_format,
-        "color_mode": imgset.color_mode,
-        "quality": imgset.quality,
+        "file_format": img.file_format,
+        "color_mode": img.color_mode,
+        "quality": img.quality,
         "rx": r.resolution_x,
         "ry": r.resolution_y,
         "rp": r.resolution_percentage,
@@ -104,9 +107,9 @@ def _capture_jpeg(path, width, height, quality):
 
     r.filepath = path
     r.use_file_extension = True
-    imgset.file_format = 'JPEG'
-    imgset.color_mode = 'RGB'
-    imgset.quality = quality
+    img.file_format = 'JPEG'
+    img.color_mode = 'RGB'
+    img.quality = quality
     r.resolution_x = width
     r.resolution_y = height
     r.resolution_percentage = 100
@@ -118,11 +121,10 @@ def _capture_jpeg(path, width, height, quality):
     except Exception:
         ok = False
 
-    # Restore
     r.filepath = old["filepath"]
-    imgset.file_format = old["file_format"]
-    imgset.color_mode = old["color_mode"]
-    imgset.quality = old["quality"]
+    img.file_format = old["file_format"]
+    img.color_mode = old["color_mode"]
+    img.quality = old["quality"]
     r.resolution_x = old["rx"]
     r.resolution_y = old["ry"]
     r.resolution_percentage = old["rp"]
@@ -131,123 +133,51 @@ def _capture_jpeg(path, width, height, quality):
     return ok and os.path.exists(path)
 
 
-# ---------------------------------------------------------
-# High Sensitivity Fingerprint (128×72)
-# ---------------------------------------------------------
-
-def _quick_viewport_fingerprint():
-    win, area, region = _find_viewport_region()
-    if not win:
-        return None
-
-    ctx = bpy.context
-    scene = ctx.scene
-    r = scene.render
-    imgset = r.image_settings
-
-    temp_path = os.path.join(bpy.app.tempdir, "tl_fingerprint.jpg")
-
-    old = {
-        "filepath": r.filepath,
-        "file_format": imgset.file_format,
-        "color_mode": imgset.color_mode,
-        "quality": imgset.quality,
-        "rx": r.resolution_x,
-        "ry": r.resolution_y,
-        "rp": r.resolution_percentage,
-        "ufe": r.use_file_extension,
-    }
-
-    r.filepath = temp_path
-    r.use_file_extension = True
-    imgset.file_format = 'JPEG'
-    imgset.color_mode = 'RGB'
-    imgset.quality = 70
-    r.resolution_x = 128
-    r.resolution_y = 72
-    r.resolution_percentage = 100
-
-    fp = None
-
-    try:
-        with ctx.temp_override(window=win, area=area, region=region):
-            bpy.ops.render.opengl(write_still=True, view_context=True)
-    except Exception:
-        fp = None
-    else:
-        if os.path.exists(temp_path):
-            try:
-                with open(temp_path, "rb") as f:
-                    fp = hashlib.md5(f.read()).hexdigest()
-            except:
-                fp = None
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-
-    r.filepath = old["filepath"]
-    imgset.file_format = old["file_format"]
-    imgset.color_mode = old["color_mode"]
-    imgset.quality = old["quality"]
-    r.resolution_x = old["rx"]
-    r.resolution_y = old["ry"]
-    r.resolution_percentage = old["rp"]
-    r.use_file_extension = old["ufe"]
-
-    return fp
-
-
-# ---------------------------------------------------------
-# Scene Properties
-# ---------------------------------------------------------
+# =========================================================
+# Properties
+# =========================================================
 
 class TL_Props(PropertyGroup):
     output_dir: StringProperty(
         name="Folder",
-        description="Folder where screenshots are saved (empty = //timelapse next to .blend)",
         subtype="DIR_PATH",
         default=""
     )
     prefix: StringProperty(
         name="Prefix",
-        description="Filename prefix for each screenshot",
         default="snap"
     )
     interval: IntProperty(
         name="Interval (seconds)",
-        description="Time between screenshots",
         min=1,
         default=10
     )
     jpeg_quality: IntProperty(
         name="JPEG Quality",
-        description="Output image quality",
         min=1, max=100,
         default=70
     )
     resolution: EnumProperty(
         name="Resolution",
-        description="Final screenshot resolution",
-        items=[('1080p', "1920×1080", ""), ('720p', "1280×720", "")],
+        items=[
+            ('1080p', "1920×1080", ""),
+            ('720p', "1280×720", "")
+        ],
         default='1080p'
     )
     mp4_fps: IntProperty(
         name="MP4 FPS",
-        description="Frames per second for MP4",
         min=1, max=120,
         default=24
     )
     mp4_quality: EnumProperty(
         name="MP4 Quality",
-        description="H.264 quality",
-        items=[('LOW', "Low", ""), ('MEDIUM', "Medium", ""), ('HIGH', "High", "")],
+        items=[
+            ('LOW', "Low", ""),
+            ('MEDIUM', "Medium", ""),
+            ('HIGH', "High", "")
+        ],
         default='MEDIUM'
-    )
-    skip_unchanged: BoolProperty(
-        name="Skip Unchanged Frames",
-        description="Avoid saving images when nothing visually changes",
-        default=True
     )
 
 
@@ -255,9 +185,9 @@ def _props():
     return bpy.context.scene.timelapse_props
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Pre-start test
-# ---------------------------------------------------------
+# =========================================================
 
 def _test_capture():
     p = _props()
@@ -270,74 +200,93 @@ def _test_capture():
     return ok and exists
 
 
-# ---------------------------------------------------------
-# Start / Stop operators
-# ---------------------------------------------------------
+# =========================================================
+# Start / Stop Operators
+# =========================================================
 
 class VIEW3D_OT_timelapse_start(Operator):
     bl_idname = "view3d.timelapse_start"
     bl_label = "Start Screenshots"
-    bl_description = "Begin automatic screenshot timelapse"
-    bl_options = {'INTERNAL'}
 
     def execute(self, context):
-        global _RUNNING, _TIMER, _LAST_FP
+        global _RUNNING, _TIMER, _NEXT_CAPTURE_TIME, _LAST_INTERACTION_TIME
 
         if not bpy.data.filepath:
-            self.report({'ERROR'}, "Save your .blend file first.")
+            self.report({'ERROR'}, "Save your .blend first.")
             return {'CANCELLED'}
 
         if _RUNNING:
             return {'CANCELLED'}
 
         if not _test_capture():
-            self.report({'ERROR'},
-                        "Screenshot failed. On macOS, ensure Blender has Full Disk Access.")
+            self.report({'ERROR'}, "Screenshot failed. On macOS: grant Full Disk Access.")
             return {'CANCELLED'}
 
-        _LAST_FP = None
         p = _props()
+        wm = context.window_manager
+        _TIMER = wm.event_timer_add(0.1, window=context.window)
 
         _RUNNING = True
-        _TIMER = context.window_manager.event_timer_add(
-            time_step=float(p.interval),
-            window=context.window
-        )
-        context.window_manager.modal_handler_add(self)
+        _NEXT_CAPTURE_TIME = time.time() + float(p.interval)
+        _LAST_INTERACTION_TIME = time.time()
+
+        wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        global _RUNNING, _LAST_FP
+        global _RUNNING, _TIMER, _NEXT_CAPTURE_TIME, _LAST_INTERACTION_TIME
+
         if not _RUNNING:
             return {'CANCELLED'}
 
-        if event.type == "TIMER":
-            p = _props()
+        now = time.time()
 
-            # Skip unchanged?
-            if p.skip_unchanged:
-                fp = _quick_viewport_fingerprint()
-                if fp is not None and fp == _LAST_FP:
-                    return {'PASS_THROUGH'}
-                _LAST_FP = fp
+        if event.type != "TIMER":
+            _LAST_INTERACTION_TIME = time.time()
+            return {'PASS_THROUGH'}
+        
 
-            width, height = _dims(p.resolution)
-            temp_path = os.path.join(
-                bpy.app.tempdir,
-                f"{p.prefix}_{_timestamp()}.jpg"
-            )
+        # TIMER event begins ======================================
 
-            ok = _capture_jpeg(temp_path, width, height, p.jpeg_quality)
+        p = _props()
 
-            if ok and os.path.exists(temp_path):
-                out_dir = _resolve_dir(p.output_dir)
-                _ensure_exists_after_success(out_dir)
-                final_path = os.path.join(out_dir, os.path.basename(temp_path))
-                try:
-                    os.replace(temp_path, final_path)
-                except:
-                    shutil.copy2(temp_path, final_path)
-                    os.remove(temp_path)
+        # 1. Too early → skip
+        if now < _NEXT_CAPTURE_TIME:
+            return {'PASS_THROUGH'}
+
+        # 2. Skip if user acted recently (0.3 seconds)
+        if (now - _LAST_INTERACTION_TIME) < 0.3:
+            # Allow only limited skip = interval * 1.5
+            if now < (_NEXT_CAPTURE_TIME + p.interval * 1.5):
+                return {'PASS_THROUGH'}
+
+            # ELSE → force capture
+
+        # 3. Pause if user away too long (interval * 4)
+        if (now - _LAST_INTERACTION_TIME) > (p.interval * 4):
+            return {'PASS_THROUGH'}
+
+        # 4. Perform capture
+        width, height = _dims(p.resolution)
+        temp_path = os.path.join(
+            bpy.app.tempdir,
+            f"{p.prefix}_{_timestamp()}.jpg"
+        )
+
+        ok = _capture_jpeg(temp_path, width, height, p.jpeg_quality)
+
+        if ok and os.path.exists(temp_path):
+            out = _resolve_dir(p.output_dir)
+            _ensure_dir(out)
+            final_path = os.path.join(out, os.path.basename(temp_path))
+            try:
+                os.replace(temp_path, final_path)
+            except:
+                shutil.copy2(temp_path, final_path)
+                os.remove(temp_path)
+
+        # 5. Reset next-capture timer (prevents spam)
+        _NEXT_CAPTURE_TIME = now + float(p.interval)
 
         return {'PASS_THROUGH'}
 
@@ -348,12 +297,9 @@ class VIEW3D_OT_timelapse_start(Operator):
         _RUNNING = False
 
 
-
 class VIEW3D_OT_timelapse_stop(Operator):
     bl_idname = "view3d.timelapse_stop"
     bl_label = "Stop Screenshots"
-    bl_description = "Stop automatic screenshot recording"
-    bl_options = {'INTERNAL'}
 
     def execute(self, context):
         global _RUNNING, _TIMER
@@ -363,9 +309,9 @@ class VIEW3D_OT_timelapse_stop(Operator):
         return {'FINISHED'}
 
 
-# ---------------------------------------------------------
-# MP4 Tools
-# ---------------------------------------------------------
+# =========================================================
+# MP4 Assembly
+# =========================================================
 
 def _gather(directory, prefix):
     directory = _resolve_dir(directory)
@@ -402,7 +348,7 @@ def _make_mp4(directory, prefix, width, height, fps, crf, report):
 
     se = scene.sequence_editor or scene.sequence_editor_create()
     for s in list(se.sequences_all):
-        se.sequences.remove(s)
+        se.seences.remove(s)
 
     first = os.path.join(directory, files[0])
     strip = se.sequences.new_image("TL", filepath=first, channel=1, frame_start=1)
@@ -426,40 +372,34 @@ def _make_mp4(directory, prefix, width, height, fps, crf, report):
 class VIEW3D_OT_timelapse_make_mp4(Operator):
     bl_idname = "view3d.timelapse_make_mp4"
     bl_label = "Make MP4"
-    bl_description = "Assemble all screenshots into an MP4 timelapse"
-    bl_options = {'INTERNAL'}
 
     def execute(self, context):
         p = _props()
         width, height = _dims(p.resolution)
         ok = _make_mp4(
-            p.output_dir, p.prefix, width, height, p.mp4_fps, p.mp4_quality,
-            self.report
+            p.output_dir, p.prefix, width, height,
+            p.mp4_fps, p.mp4_quality, self.report
         )
         return {'FINISHED'} if ok else {'CANCELLED'}
 
 
-
-# ---------------------------------------------------------
-# NEW: Open Screenshot Folder
-# ---------------------------------------------------------
+# =========================================================
+# Open Folder
+# =========================================================
 
 class VIEW3D_OT_timelapse_open_folder(Operator):
     bl_idname = "view3d.timelapse_open_folder"
     bl_label = "Open Folder"
-    bl_description = "Open the screenshot output folder"
-    bl_options = {'INTERNAL'}
 
     def execute(self, context):
-        p = _props()
-        folder = _resolve_dir(p.output_dir)
+        folder = _resolve_dir(_props().output_dir)
         _open_folder(folder)
         return {'FINISHED'}
 
 
-# ---------------------------------------------------------
-# UI PANELS
-# ---------------------------------------------------------
+# =========================================================
+# UI Panels
+# =========================================================
 
 class VIEW3D_PT_timelapse(Panel):
     bl_label = "Auto Screenshots"
@@ -470,21 +410,13 @@ class VIEW3D_PT_timelapse(Panel):
     def draw(self, context):
         layout = self.layout
         row = layout.row()
-        row.scale_y = 1.5
+        row.scale_y = 1.4
 
         if _RUNNING:
             row.alert = True
-            row.operator(
-                "view3d.timelapse_stop",
-                text="Stop Screenshots",
-                icon="PAUSE"
-            )
+            row.operator("view3d.timelapse_stop", text="Stop", icon="PAUSE")
         else:
-            row.operator(
-                "view3d.timelapse_start",
-                text="Start Screenshots",
-                icon="REC"
-            )
+            row.operator("view3d.timelapse_start", text="Start", icon="REC")
 
 
 class VIEW3D_PT_timelapse_options(Panel):
@@ -505,9 +437,9 @@ class VIEW3D_PT_timelapse_options(Panel):
         col.prop(p, "interval")
         col.prop(p, "jpeg_quality")
         col.prop(p, "resolution")
-        col.prop(p, "skip_unchanged")
 
         layout.separator()
+
         col = layout.column(align=True)
         col.prop(p, "mp4_fps")
         col.prop(p, "mp4_quality")
@@ -518,8 +450,6 @@ class VIEW3D_PT_timelapse_options(Panel):
         )
 
         layout.separator()
-
-        # NEW: Open Folder Button
         layout.operator(
             "view3d.timelapse_open_folder",
             text="Open Screenshot Folder",
@@ -527,9 +457,9 @@ class VIEW3D_PT_timelapse_options(Panel):
         )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Header Badge
-# ---------------------------------------------------------
+# =========================================================
 
 def _header_badge(self, context):
     if not _RUNNING:
@@ -538,9 +468,9 @@ def _header_badge(self, context):
         row.label(text="NOT RECORDING")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Registration
-# ---------------------------------------------------------
+# =========================================================
 
 classes = (
     TL_Props,
@@ -563,6 +493,7 @@ def unregister():
     del bpy.types.Scene.timelapse_props
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
+
 
 if __name__ == "__main__":
     register()
