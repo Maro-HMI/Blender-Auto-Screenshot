@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Auto Screenshots (Timelapse + Fast OpenGL)",
     "author": "Maro, Matt and ChatGPT",
-    "version": (1, 1, 0),
+    "version": (1, 1, 3),
     "blender": (4, 5, 0),
     "location": "3D View > Sidebar (N) > Auto Screenshots",
     "description": "Fast, non-blocking OpenGL timelapse screenshots with smart idle detection and MP4 assembly.",
@@ -250,6 +250,10 @@ class VIEW3D_OT_timelapse_start(Operator):
 
         p = _props()
 
+        # SAFETY: do not take screenshots during actual renders
+        if bpy.app.is_job_running("RENDER"):
+            return {'PASS_THROUGH'}
+
         # 1. Too early → skip
         if now < _NEXT_CAPTURE_TIME:
             return {'PASS_THROUGH'}
@@ -259,8 +263,7 @@ class VIEW3D_OT_timelapse_start(Operator):
             # Allow only limited skip = interval * 1.5
             if now < (_NEXT_CAPTURE_TIME + p.interval * 1.5):
                 return {'PASS_THROUGH'}
-
-            # ELSE → force capture
+            # ELSE → force capture (implicit)
 
         # 3. Pause if user away too long (interval * 4)
         if (now - _LAST_INTERACTION_TIME) > (p.interval * 4):
@@ -309,6 +312,7 @@ class VIEW3D_OT_timelapse_stop(Operator):
         return {'FINISHED'}
 
 
+
 # =========================================================
 # MP4 Assembly
 # =========================================================
@@ -348,7 +352,7 @@ def _make_mp4(directory, prefix, width, height, fps, crf, report):
 
     se = scene.sequence_editor or scene.sequence_editor_create()
     for s in list(se.sequences_all):
-        se.seences.remove(s)
+        se.sequences.remove(s)
 
     first = os.path.join(directory, files[0])
     strip = se.sequences.new_image("TL", filepath=first, channel=1, frame_start=1)
@@ -482,18 +486,45 @@ classes = (
     VIEW3D_PT_timelapse_options,
 )
 
+def _stop_timelapse_for_render(scene):
+    """Automatically stop timelapse when any render starts."""
+    global _RUNNING, _TIMER
+
+    if not _RUNNING:
+        return
+
+    wm = bpy.context.window_manager
+
+    if _TIMER:
+        try:
+            wm.event_timer_remove(_TIMER)
+        except:
+            pass
+        _TIMER = None
+
+    _RUNNING = False
+
+
+    
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.timelapse_props = bpy.props.PointerProperty(type=TL_Props)
     bpy.types.VIEW3D_HT_header.prepend(_header_badge)
+    bpy.app.handlers.render_pre.append(_stop_timelapse_for_render)
+
 
 def unregister():
+    bpy.app.handlers.render_pre.remove(_on_render_start)
     bpy.types.VIEW3D_HT_header.remove(_header_badge)
     del bpy.types.Scene.timelapse_props
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
+    # NEW: remove render-pre handler if present
+    if _stop_timelapse_for_render in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.remove(_stop_timelapse_for_render)
 
 if __name__ == "__main__":
     register()
