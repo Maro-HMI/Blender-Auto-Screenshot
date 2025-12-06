@@ -516,7 +516,6 @@ def register():
 
 
 def unregister():
-    bpy.app.handlers.render_pre.remove(_on_render_start)
     bpy.types.VIEW3D_HT_header.remove(_header_badge)
     del bpy.types.Scene.timelapse_props
     for c in reversed(classes):
