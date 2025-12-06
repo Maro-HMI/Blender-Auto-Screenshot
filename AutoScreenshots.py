@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Auto Screenshots (Timelapse + Fast OpenGL)",
     "author": "Maro, Matt and ChatGPT",
-    "version": (1, 1, 3),
+    "version": (1, 1, 4),
     "blender": (4, 5, 0),
     "location": "3D View > Sidebar (N) > Auto Screenshots",
     "description": "Fast, non-blocking OpenGL timelapse screenshots with smart idle detection and MP4 assembly.",
